@@ -26,6 +26,7 @@ policy, hooks, and lifecycle controls on top.
 import json
 import os
 import subprocess
+from datetime import datetime
 
 import requests
 from dotenv import load_dotenv
@@ -141,22 +142,60 @@ def agent_loop(messages: list):
         messages.extend(results)
 
 
+def save_history(history: list, logs_dir: str = "logs"):
+    """Save conversation history to JSON file."""
+    os.makedirs(logs_dir, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename = f"conversation_{timestamp}.json"
+    filepath = os.path.join(logs_dir, filename)
+    
+    # Clean up any invalid Unicode characters (surrogates)
+    def clean_text(text):
+        if isinstance(text, str):
+            # Remove surrogate characters that can't be encoded
+            return ''.join(c for c in text if ord(c) < 0xD800 or ord(c) > 0xDFFF)
+        return text
+    
+    clean_history = []
+    for msg in history:
+        clean_msg = {
+            "role": msg.get("role", ""),
+            "content": clean_text(msg.get("content", "")),
+        }
+        if "tool_call_id" in msg:
+            clean_msg["tool_call_id"] = msg["tool_call_id"]
+        clean_history.append(clean_msg)
+    
+    with open(filepath, "w", encoding="utf-8") as f:
+        json.dump(clean_history, f, ensure_ascii=False, indent=2)
+    
+    print(f"\n\033[90m[對話已保存至：{filepath}]\033[0m")
+    return filepath
+
+
 if __name__ == "__main__":
     history = []
-    while True:
-        try:
-            query = input("\033[36ms01 >> \033[0m")
-        except (EOFError, KeyboardInterrupt):
-            break
-        if query.strip().lower() in ("q", "exit", ""):
-            break
-        history.append({"role": "user", "content": query})
-        agent_loop(history)
-        # Print the last assistant message
-        for msg in reversed(history):
-            if msg.get("role") == "assistant":
-                content = msg.get("content", "")
-                if isinstance(content, str) and content.strip():
-                    print(content)
+    try:
+        while True:
+            try:
+                query = input("\033[36ms01 >> \033[0m")
+            except EOFError:
                 break
-        print()
+            if query.strip().lower() in ("q", "exit", ""):
+                break
+            history.append({"role": "user", "content": query})
+            agent_loop(history)
+            # Print the last assistant message
+            for msg in reversed(history):
+                if msg.get("role") == "assistant":
+                    content = msg.get("content", "")
+                    if isinstance(content, str) and content.strip():
+                        print(content)
+                    break
+            print()
+    except KeyboardInterrupt:
+        print("\n\033[90m[中斷訊號收到]\033[0m")
+    finally:
+        # 無論如何退出都要保存
+        if history:
+            save_history(history)
