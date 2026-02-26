@@ -1,0 +1,61 @@
+[
+  {
+    "role": "user",
+    "content": "幫我建立一個 hello.py 檔案，內容是 print(\"Hello World\")"
+  },
+  {
+    "role": "assistant",
+    "content": ""
+  },
+  {
+    "role": "tool",
+    "content": "(no output)",
+    "tool_call_id": "chatcmpl-tool-86f3f5ebcb8d95e1"
+  },
+  {
+    "role": "assistant",
+    "content": ""
+  },
+  {
+    "role": "user",
+    "content": "執行 python hello.py"
+  },
+  {
+    "role": "assistant",
+    "content": ""
+  },
+  {
+    "role": "user",
+    "content": "執行後有顯示內容嗎"
+  },
+  {
+    "role": "assistant",
+    "content": ""
+  },
+  {
+    "role": "tool",
+    "content": "(no output)",
+    "tool_call_id": "chatcmpl-tool-b65032e8e9b43fc8"
+  },
+  {
+    "role": "assistant",
+    "content": ""
+  },
+  {
+    "role": "user",
+    "content": "執行後有顯示內容嗎"
+  },
+  {
+    "role": "assistant",
+    "content": ""
+  },
+  {
+    "role": "tool",
+    "content": "Hello World",
+    "tool_call_id": "chatcmpl-tool-99d61349426d9936"
+  },
+  {
+    "role": "assistant",
+    "content": "有顯示內容了，執行後顯示了 \"Hello World\"。"
+  }
+]
