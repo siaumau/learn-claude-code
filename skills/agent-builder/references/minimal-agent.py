@@ -6,19 +6,21 @@ This is the simplest possible working agent (~80 lines).
 It has everything you need: 3 tools + loop.
 
 Usage:
-    1. Set ANTHROPIC_API_KEY environment variable
+    1. Set OPENROUTER_API_KEY environment variable
     2. python minimal-agent.py
     3. Type commands, 'q' to quit
 """
 
-from anthropic import Anthropic
+import json
+import requests
 from pathlib import Path
 import subprocess
 import os
 
 # Configuration
-client = Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
-MODEL = os.getenv("MODEL_NAME", "claude-sonnet-4-20250514")
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
+OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
+MODEL = os.getenv("MODEL_NAME", "arcee-ai/trinity-large-preview:free")
 WORKDIR = Path.cwd()
 
 # System prompt - keep it simple
@@ -34,7 +36,7 @@ TOOLS = [
     {
         "name": "bash",
         "description": "Run shell command",
-        "input_schema": {
+        "parameters": {
             "type": "object",
             "properties": {"command": {"type": "string"}},
             "required": ["command"]
@@ -43,7 +45,7 @@ TOOLS = [
     {
         "name": "read_file",
         "description": "Read file contents",
-        "input_schema": {
+        "parameters": {
             "type": "object",
             "properties": {"path": {"type": "string"}},
             "required": ["path"]
@@ -52,7 +54,7 @@ TOOLS = [
     {
         "name": "write_file",
         "description": "Write content to file",
-        "input_schema": {
+        "parameters": {
             "type": "object",
             "properties": {
                 "path": {"type": "string"},
@@ -62,6 +64,50 @@ TOOLS = [
         }
     },
 ]
+
+
+def call_openrouter(messages, system=None):
+    """Call OpenRouter API and return parsed response."""
+    openai_messages = []
+    if system:
+        openai_messages.append({"role": "system", "content": system})
+    openai_messages.extend(messages)
+    
+    payload = {
+        "model": MODEL,
+        "messages": openai_messages,
+        "max_tokens": 8000,
+        "tools": TOOLS,
+        "tool_choice": "auto"
+    }
+    
+    response = requests.post(
+        OPENROUTER_URL,
+        headers={
+            "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+            "Content-Type": "application/json",
+        },
+        data=json.dumps(payload),
+    )
+    response.raise_for_status()
+    data = response.json()
+    
+    choice = data.get("choices", [{}])[0].get("message", {})
+    content = choice.get("content", "")
+    tool_calls = []
+    for tc in choice.get("tool_calls", []):
+        if tc.get("type") == "function":
+            func = tc.get("function", {})
+            try:
+                args = json.loads(func.get("arguments", "{}"))
+            except json.JSONDecodeError:
+                args = {}
+            tool_calls.append({
+                "id": tc.get("id", ""),
+                "name": func.get("name", ""),
+                "arguments": args
+            })
+    return content, tool_calls
 
 
 def execute_tool(name: str, args: dict) -> str:
@@ -102,35 +148,28 @@ def agent(prompt: str, history: list = None) -> str:
     history.append({"role": "user", "content": prompt})
 
     while True:
-        response = client.messages.create(
-            model=MODEL,
-            system=SYSTEM,
-            messages=history,
-            tools=TOOLS,
-            max_tokens=8000,
-        )
+        content, tool_calls = call_openrouter(history, SYSTEM)
 
         # Build assistant message
-        history.append({"role": "assistant", "content": response.content})
+        history.append({"role": "assistant", "content": content})
 
         # If no tool calls, return text
-        if response.stop_reason != "tool_use":
-            return "".join(b.text for b in response.content if hasattr(b, "text"))
+        if not tool_calls:
+            return content
 
         # Execute tools
         results = []
-        for block in response.content:
-            if block.type == "tool_use":
-                print(f"> {block.name}: {block.input}")
-                output = execute_tool(block.name, block.input)
-                print(f"  {output[:100]}...")
-                results.append({
-                    "type": "tool_result",
-                    "tool_use_id": block.id,
-                    "content": output
-                })
+        for tc in tool_calls:
+            print(f"> {tc['name']}: {tc['arguments']}")
+            output = execute_tool(tc["name"], tc["arguments"])
+            print(f"  {output[:100]}...")
+            results.append({
+                "role": "tool",
+                "tool_call_id": tc["id"],
+                "content": output
+            })
 
-        history.append({"role": "user", "content": results})
+        history.extend(results)
 
 
 if __name__ == "__main__":

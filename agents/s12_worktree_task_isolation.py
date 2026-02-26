@@ -36,17 +36,16 @@ import subprocess
 import time
 from pathlib import Path
 
-from anthropic import Anthropic
+import requests
 from dotenv import load_dotenv
 
 load_dotenv(override=True)
 
-if os.getenv("ANTHROPIC_BASE_URL"):
-    os.environ.pop("ANTHROPIC_AUTH_TOKEN", None)
+OPENROUTER_API_KEY = os.environ["OPENROUTER_API_KEY"]
+OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
+MODEL = os.environ.get("MODEL_ID", "arcee-ai/trinity-large-preview:free")
 
 WORKDIR = Path.cwd()
-client = Anthropic(base_url=os.getenv("ANTHROPIC_BASE_URL"))
-MODEL = os.environ["MODEL_ID"]
 
 
 def detect_repo_root(cwd: Path) -> Path | None:
@@ -551,11 +550,116 @@ TOOL_HANDLERS = {
     "worktree_events": lambda **kw: EVENTS.list_recent(kw.get("limit", 20)),
 }
 
+
+def call_openrouter(messages: list, tools: list = None, system: str = None):
+    """Call OpenRouter API and return parsed response."""
+    openai_messages = []
+    if system:
+        openai_messages.append({"role": "system", "content": system})
+    
+    for msg in messages:
+        role = msg.get("role")
+        content = msg.get("content", "")
+        
+        if role == "user" and isinstance(content, list):
+            new_content = []
+            for part in content:
+                if isinstance(part, dict):
+                    if part.get("type") == "tool_result":
+                        openai_messages.append({
+                            "role": "tool",
+                            "tool_call_id": part.get("tool_use_id", ""),
+                            "content": str(part.get("content", ""))
+                        })
+                    elif part.get("type") == "text":
+                        new_content.append(part.get("text", ""))
+                else:
+                    new_content.append(str(part))
+            if new_content:
+                openai_messages.append({"role": "user", "content": "\n".join(new_content)})
+        elif role == "assistant" and isinstance(content, list):
+            text_parts = []
+            tool_calls = []
+            for part in content:
+                if hasattr(part, "type"):
+                    if part.type == "text":
+                        text_parts.append(part.text)
+                    elif part.type == "tool_use":
+                        tool_calls.append({
+                            "id": part.id,
+                            "type": "function",
+                            "function": {
+                                "name": part.name,
+                                "arguments": json.dumps(part.input)
+                            }
+                        })
+                elif isinstance(part, dict):
+                    if part.get("type") == "text":
+                        text_parts.append(part.get("text", ""))
+                    elif part.get("type") == "tool_use":
+                        tool_calls.append({
+                            "id": part.get("id", ""),
+                            "type": "function",
+                            "function": {
+                                "name": part.get("name", ""),
+                                "arguments": json.dumps(part.get("input", {}))
+                            }
+                        })
+            assistant_msg = {"role": "assistant", "content": "".join(text_parts) if text_parts else ""}
+            if tool_calls:
+                assistant_msg["tool_calls"] = tool_calls
+            openai_messages.append(assistant_msg)
+        else:
+            openai_messages.append({"role": role, "content": str(content) if content else ""})
+    
+    payload = {
+        "model": MODEL,
+        "messages": openai_messages,
+        "max_tokens": 8000,
+    }
+    if tools:
+        payload["tools"] = tools
+        payload["tool_choice"] = "auto"
+    
+    response = requests.post(
+        url=OPENROUTER_URL,
+        headers={
+            "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+            "Content-Type": "application/json",
+            "HTTP-Referer": "https://github.com/shareAI-lab/learn-claude-code",
+        },
+        data=json.dumps(payload),
+    )
+    response.raise_for_status()
+    data = response.json()
+    
+    choice = data.get("choices", [{}])[0].get("message", {})
+    result = {
+        "content": choice.get("content", ""),
+        "tool_calls": [],
+    }
+    
+    for tc in choice.get("tool_calls", []):
+        if tc.get("type") == "function":
+            func = tc.get("function", {})
+            try:
+                args = json.loads(func.get("arguments", "{}"))
+            except json.JSONDecodeError:
+                args = {}
+            result["tool_calls"].append({
+                "id": tc.get("id", ""),
+                "name": func.get("name", ""),
+                "arguments": args,
+            })
+    
+    return result
+
+
 TOOLS = [
     {
         "name": "bash",
         "description": "Run a shell command in the current workspace (blocking).",
-        "input_schema": {
+        "parameters": {
             "type": "object",
             "properties": {"command": {"type": "string"}},
             "required": ["command"],
@@ -727,34 +831,33 @@ TOOLS = [
 
 def agent_loop(messages: list):
     while True:
-        response = client.messages.create(
-            model=MODEL,
-            system=SYSTEM,
+        response = call_openrouter(
             messages=messages,
             tools=TOOLS,
-            max_tokens=8000,
+            system=SYSTEM,
         )
-        messages.append({"role": "assistant", "content": response.content})
-        if response.stop_reason != "tool_use":
+        resp_content = response.get("content", "")
+        tool_calls = response.get("tool_calls", [])
+        messages.append({"role": "assistant", "content": resp_content})
+        if not tool_calls:
             return
 
         results = []
-        for block in response.content:
-            if block.type == "tool_use":
-                handler = TOOL_HANDLERS.get(block.name)
-                try:
-                    output = handler(**block.input) if handler else f"Unknown tool: {block.name}"
-                except Exception as e:
-                    output = f"Error: {e}"
-                print(f"> {block.name}: {str(output)[:200]}")
-                results.append(
-                    {
-                        "type": "tool_result",
-                        "tool_use_id": block.id,
-                        "content": str(output),
-                    }
-                )
-        messages.append({"role": "user", "content": results})
+        for tc in tool_calls:
+            handler = TOOL_HANDLERS.get(tc["name"])
+            try:
+                output = handler(**tc["arguments"]) if handler else f"Unknown tool: {tc['name']}"
+            except Exception as e:
+                output = f"Error: {e}"
+            print(f"> {tc['name']}: {str(output)[:200]}")
+            results.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": tc["id"],
+                    "content": str(output),
+                }
+            )
+        messages.extend(results)
 
 
 if __name__ == "__main__":

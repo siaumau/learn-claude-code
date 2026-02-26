@@ -26,18 +26,18 @@ Core insight: One tool (bash) can do everything.
 Subagents via self-recursion: python {name}.py "subtask"
 """
 
-from anthropic import Anthropic
-from dotenv import load_dotenv
-import subprocess
+import json
 import os
+import subprocess
+
+import requests
+from dotenv import load_dotenv
 
 load_dotenv()
 
-client = Anthropic(
-    api_key=os.getenv("ANTHROPIC_API_KEY"),
-    base_url=os.getenv("ANTHROPIC_BASE_URL")
-)
-MODEL = os.getenv("MODEL_NAME", "claude-sonnet-4-20250514")
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
+OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
+MODEL = os.getenv("MODEL_NAME", "arcee-ai/trinity-large-preview:free")
 
 SYSTEM = """You are a coding agent. Use bash for everything:
 - Read: cat, grep, find, ls
@@ -45,30 +45,47 @@ SYSTEM = """You are a coding agent. Use bash for everything:
 - Subagent: python {name}.py "subtask"
 """
 
-TOOL = [{{
+TOOLS = [{{
     "name": "bash",
     "description": "Execute shell command",
-    "input_schema": {{"type": "object", "properties": {{"command": {{"type": "string"}}}}, "required": ["command"]}}
+    "parameters": {{"type": "object", "properties": {{"command": {{"type": "string"}}}}, "required": ["command"]}}
 }}]
+
+def call_openrouter(messages, system=None):
+    openai_messages = []
+    if system:
+        openai_messages.append({{"role": "system", "content": system}})
+    openai_messages.extend(messages)
+    payload = {{"model": MODEL, "messages": openai_messages, "max_tokens": 8000}}
+    response = requests.post(
+        OPENROUTER_URL,
+        headers={{"Authorization": f"Bearer {{OPENROUTER_API_KEY}}", "Content-Type": "application/json"}},
+        data=json.dumps(payload)
+    )
+    response.raise_for_status()
+    data = response.json()
+    choice = data.get("choices", [{{}}])[0].get("message", {{}})
+    return choice.get("content", ""), choice.get("tool_calls", [])
 
 def run(prompt, history=[]):
     history.append({{"role": "user", "content": prompt}})
     while True:
-        r = client.messages.create(model=MODEL, system=SYSTEM, messages=history, tools=TOOL, max_tokens=8000)
-        history.append({{"role": "assistant", "content": r.content}})
-        if r.stop_reason != "tool_use":
-            return "".join(b.text for b in r.content if hasattr(b, "text"))
+        content, tool_calls = call_openrouter(history, SYSTEM)
+        history.append({{"role": "assistant", "content": content}})
+        if not tool_calls:
+            return content
         results = []
-        for b in r.content:
-            if b.type == "tool_use":
-                print(f"> {{b.input['command']}}")
+        for tc in tool_calls:
+            if tc["name"] == "bash":
+                cmd = tc["arguments"]["command"]
+                print(f"> {{cmd}}")
                 try:
-                    out = subprocess.run(b.input["command"], shell=True, capture_output=True, text=True, timeout=60)
+                    out = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=60)
                     output = (out.stdout + out.stderr).strip() or "(empty)"
                 except Exception as e:
                     output = f"Error: {{e}}"
-                results.append({{"type": "tool_result", "tool_use_id": b.id, "content": output[:50000]}})
-        history.append({{"role": "user", "content": results}})
+                results.append({{"role": "tool", "tool_call_id": tc["id"], "content": output[:50000]}})
+        history.extend(results)
 
 if __name__ == "__main__":
     h = []
@@ -85,19 +102,19 @@ Core insight: 4 tools cover 90% of coding tasks.
 The model IS the agent. Code just runs the loop.
 """
 
-from anthropic import Anthropic
+import json
+import os
+import subprocess
+
+import requests
 from dotenv import load_dotenv
 from pathlib import Path
-import subprocess
-import os
 
 load_dotenv()
 
-client = Anthropic(
-    api_key=os.getenv("ANTHROPIC_API_KEY"),
-    base_url=os.getenv("ANTHROPIC_BASE_URL")
-)
-MODEL = os.getenv("MODEL_NAME", "claude-sonnet-4-20250514")
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
+OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
+MODEL = os.getenv("MODEL_NAME", "arcee-ai/trinity-large-preview:free")
 WORKDIR = Path.cwd()
 
 SYSTEM = f"""You are a coding agent at {{WORKDIR}}.
@@ -110,13 +127,13 @@ Rules:
 
 TOOLS = [
     {{"name": "bash", "description": "Run shell command",
-     "input_schema": {{"type": "object", "properties": {{"command": {{"type": "string"}}}}, "required": ["command"]}}}},
+     "parameters": {{"type": "object", "properties": {{"command": {{"type": "string"}}}}, "required": ["command"]}}}},
     {{"name": "read_file", "description": "Read file contents",
-     "input_schema": {{"type": "object", "properties": {{"path": {{"type": "string"}}}}, "required": ["path"]}}}},
+     "parameters": {{"type": "object", "properties": {{"path": {{"type": "string"}}}}, "required": ["path"]}}}},
     {{"name": "write_file", "description": "Write content to file",
-     "input_schema": {{"type": "object", "properties": {{"path": {{"type": "string"}}, "content": {{"type": "string"}}}}, "required": ["path", "content"]}}}},
+     "parameters": {{"type": "object", "properties": {{"path": {{"type": "string"}}, "content": {{"type": "string"}}}}, "required": ["path", "content"]}}}},
     {{"name": "edit_file", "description": "Replace exact text in file",
-     "input_schema": {{"type": "object", "properties": {{"path": {{"type": "string"}}, "old_text": {{"type": "string"}}, "new_text": {{"type": "string"}}}}, "required": ["path", "old_text", "new_text"]}}}},
+     "parameters": {{"type": "object", "properties": {{"path": {{"type": "string"}}, "old_text": {{"type": "string"}}, "new_text": {{"type": "string"}}}}, "required": ["path", "old_text", "new_text"]}}}},
 ]
 
 def safe_path(p: str) -> Path:
@@ -168,6 +185,32 @@ def execute(name: str, args: dict) -> str:
 
     return f"Unknown tool: {{name}}"
 
+def call_openrouter(messages, system=None):
+    openai_messages = []
+    if system:
+        openai_messages.append({{"role": "system", "content": system}})
+    openai_messages.extend(messages)
+    payload = {{"model": MODEL, "messages": openai_messages, "max_tokens": 8000, "tools": TOOLS, "tool_choice": "auto"}}
+    response = requests.post(
+        OPENROUTER_URL,
+        headers={{"Authorization": f"Bearer {{OPENROUTER_API_KEY}}", "Content-Type": "application/json"}},
+        data=json.dumps(payload)
+    )
+    response.raise_for_status()
+    data = response.json()
+    choice = data.get("choices", [{{}}])[0].get("message", {{}})
+    content = choice.get("content", "")
+    tool_calls = []
+    for tc in choice.get("tool_calls", []):
+        if tc.get("type") == "function":
+            func = tc.get("function", {{}})
+            try:
+                args = json.loads(func.get("arguments", "{{}}"))
+            except json.JSONDecodeError:
+                args = {{}}
+            tool_calls.append({{"id": tc.get("id", ""), "name": func.get("name", ""), "arguments": args}})
+    return content, tool_calls
+
 def agent(prompt: str, history: list = None) -> str:
     """Run the agent loop."""
     if history is None:
@@ -175,22 +218,19 @@ def agent(prompt: str, history: list = None) -> str:
     history.append({{"role": "user", "content": prompt}})
 
     while True:
-        response = client.messages.create(
-            model=MODEL, system=SYSTEM, messages=history, tools=TOOLS, max_tokens=8000
-        )
-        history.append({{"role": "assistant", "content": response.content}})
+        content, tool_calls = call_openrouter(history, SYSTEM)
+        history.append({{"role": "assistant", "content": content}})
 
-        if response.stop_reason != "tool_use":
-            return "".join(b.text for b in response.content if hasattr(b, "text"))
+        if not tool_calls:
+            return content
 
         results = []
-        for block in response.content:
-            if block.type == "tool_use":
-                print(f"> {{block.name}}: {{str(block.input)[:100]}}")
-                output = execute(block.name, block.input)
-                print(f"  {{output[:100]}}...")
-                results.append({{"type": "tool_result", "tool_use_id": block.id, "content": output}})
-        history.append({{"role": "user", "content": results}})
+        for tc in tool_calls:
+            print(f"> {{tc['name']}}: {{str(tc['arguments'])[:100]}}")
+            output = execute(tc["name"], tc["arguments"])
+            print(f"  {{output[:100]}}...")
+            results.append({{"role": "tool", "tool_call_id": tc["id"], "content": output}})
+        history.extend(results)
 
 if __name__ == "__main__":
     print(f"{name} - Level 1 Agent at {{WORKDIR}}")
@@ -208,9 +248,8 @@ if __name__ == "__main__":
 }
 
 ENV_TEMPLATE = '''# API Configuration
-ANTHROPIC_API_KEY=sk-xxx
-ANTHROPIC_BASE_URL=https://api.anthropic.com
-MODEL_NAME=claude-sonnet-4-20250514
+OPENROUTER_API_KEY=sk-or-v1-xxx
+MODEL_ID=arcee-ai/trinity-large-preview:free
 '''
 
 
@@ -247,8 +286,8 @@ def create_agent(name: str, level: int, output_dir: Path):
     print(f"\nNext steps:")
     print(f"  1. cd {agent_dir}")
     print(f"  2. cp .env.example .env")
-    print(f"  3. Edit .env with your API key")
-    print(f"  4. pip install anthropic python-dotenv")
+    print(f"  3. Edit .env with your OPENROUTER_API_KEY")
+    print(f"  4. pip install requests python-dotenv")
     print(f"  5. python {name}.py")
 
 

@@ -39,17 +39,15 @@ import subprocess
 import time
 from pathlib import Path
 
-from anthropic import Anthropic
+import requests
 from dotenv import load_dotenv
 
 load_dotenv(override=True)
 
-if os.getenv("ANTHROPIC_BASE_URL"):
-    os.environ.pop("ANTHROPIC_AUTH_TOKEN", None)
-
 WORKDIR = Path.cwd()
-client = Anthropic(base_url=os.getenv("ANTHROPIC_BASE_URL"))
-MODEL = os.environ["MODEL_ID"]
+OPENROUTER_API_KEY = os.environ["OPENROUTER_API_KEY"]
+OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
+MODEL = os.environ.get("MODEL_ID", "arcee-ai/trinity-large-preview:free")
 
 SYSTEM = f"You are a coding agent at {WORKDIR}. Use tools to solve tasks."
 
@@ -60,7 +58,7 @@ KEEP_RECENT = 3
 
 def estimate_tokens(messages: list) -> int:
     """Rough token count: ~4 chars per token."""
-    return len(str(messages)) // 4
+    return len(json.dumps(messages, default=str)) // 4
 
 
 # -- Layer 1: micro_compact - replace old tool results with placeholders --
@@ -78,18 +76,14 @@ def micro_compact(messages: list) -> list:
     tool_name_map = {}
     for msg in messages:
         if msg["role"] == "assistant":
-            content = msg.get("content", [])
-            if isinstance(content, list):
-                for block in content:
-                    if hasattr(block, "type") and block.type == "tool_use":
-                        tool_name_map[block.id] = block.name
+            content = msg.get("content", "")
+            # In OpenAI format, we don't have structured tool_use blocks in content
+            # We'll use a simpler approach - just clear old results
     # Clear old results (keep last KEEP_RECENT)
     to_clear = tool_results[:-KEEP_RECENT]
     for _, _, result in to_clear:
         if isinstance(result.get("content"), str) and len(result["content"]) > 100:
-            tool_id = result.get("tool_use_id", "")
-            tool_name = tool_name_map.get(tool_id, "unknown")
-            result["content"] = f"[Previous: used {tool_name}]"
+            result["content"] = "[Previous: tool result cleared]"
     return messages
 
 
@@ -104,15 +98,13 @@ def auto_compact(messages: list) -> list:
     print(f"[transcript saved: {transcript_path}]")
     # Ask LLM to summarize
     conversation_text = json.dumps(messages, default=str)[:80000]
-    response = client.messages.create(
-        model=MODEL,
-        messages=[{"role": "user", "content":
+    response = call_openrouter(
+        [{"role": "user", "content":
             "Summarize this conversation for continuity. Include: "
             "1) What was accomplished, 2) Current state, 3) Key decisions made. "
-            "Be concise but preserve critical details.\n\n" + conversation_text}],
-        max_tokens=2000,
+            "Be concise but preserve critical details.\n\n" + conversation_text}]
     )
-    summary = response.content[0].text
+    summary = response.get("content", "")
     # Replace all messages with compressed summary
     return [
         {"role": "user", "content": f"[Conversation compressed. Transcript: {transcript_path}]\n\n{summary}"},
@@ -179,16 +171,66 @@ TOOL_HANDLERS = {
 
 TOOLS = [
     {"name": "bash", "description": "Run a shell command.",
-     "input_schema": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}},
+     "parameters": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}},
     {"name": "read_file", "description": "Read file contents.",
-     "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "limit": {"type": "integer"}}, "required": ["path"]}},
+     "parameters": {"type": "object", "properties": {"path": {"type": "string"}, "limit": {"type": "integer"}}, "required": ["path"]}},
     {"name": "write_file", "description": "Write content to file.",
-     "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "content": {"type": "string"}}, "required": ["path", "content"]}},
+     "parameters": {"type": "object", "properties": {"path": {"type": "string"}, "content": {"type": "string"}}, "required": ["path", "content"]}},
     {"name": "edit_file", "description": "Replace exact text in file.",
-     "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "old_text": {"type": "string"}, "new_text": {"type": "string"}}, "required": ["path", "old_text", "new_text"]}},
+     "parameters": {"type": "object", "properties": {"path": {"type": "string"}, "old_text": {"type": "string"}, "new_text": {"type": "string"}}, "required": ["path", "old_text", "new_text"]}},
     {"name": "compact", "description": "Trigger manual conversation compression.",
-     "input_schema": {"type": "object", "properties": {"focus": {"type": "string", "description": "What to preserve in the summary"}}}},
+     "parameters": {"type": "object", "properties": {"focus": {"type": "string", "description": "What to preserve in the summary"}}}, "required": []},
 ]
+
+
+def call_openrouter(messages: list, tools: list = None, system: str = None):
+    """Call OpenRouter API and return parsed response."""
+    openai_messages = []
+    if system:
+        openai_messages.append({"role": "system", "content": system})
+    openai_messages.extend(messages)
+
+    payload = {
+        "model": MODEL,
+        "messages": openai_messages,
+        "max_tokens": 8000,
+    }
+    if tools:
+        payload["tools"] = tools
+        payload["tool_choice"] = "auto"
+
+    response = requests.post(
+        url=OPENROUTER_URL,
+        headers={
+            "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+            "Content-Type": "application/json",
+            "HTTP-Referer": "https://github.com/shareAI-lab/learn-claude-code",
+        },
+        data=json.dumps(payload),
+    )
+    response.raise_for_status()
+    data = response.json()
+
+    choice = data.get("choices", [{}])[0].get("message", {})
+    result = {
+        "content": choice.get("content", ""),
+        "tool_calls": [],
+    }
+
+    for tc in choice.get("tool_calls", []):
+        if tc.get("type") == "function":
+            func = tc.get("function", {})
+            try:
+                args = json.loads(func.get("arguments", "{}"))
+            except json.JSONDecodeError:
+                args = {}
+            result["tool_calls"].append({
+                "id": tc.get("id", ""),
+                "name": func.get("name", ""),
+                "arguments": args,
+            })
+
+    return result
 
 
 def agent_loop(messages: list):
@@ -199,29 +241,27 @@ def agent_loop(messages: list):
         if estimate_tokens(messages) > THRESHOLD:
             print("[auto_compact triggered]")
             messages[:] = auto_compact(messages)
-        response = client.messages.create(
-            model=MODEL, system=SYSTEM, messages=messages,
-            tools=TOOLS, max_tokens=8000,
-        )
-        messages.append({"role": "assistant", "content": response.content})
-        if response.stop_reason != "tool_use":
+        response = call_openrouter(messages, TOOLS, SYSTEM)
+        resp_content = response.get("content", "")
+        tool_calls = response.get("tool_calls", [])
+        messages.append({"role": "assistant", "content": resp_content})
+        if not tool_calls:
             return
         results = []
         manual_compact = False
-        for block in response.content:
-            if block.type == "tool_use":
-                if block.name == "compact":
-                    manual_compact = True
-                    output = "Compressing..."
-                else:
-                    handler = TOOL_HANDLERS.get(block.name)
-                    try:
-                        output = handler(**block.input) if handler else f"Unknown tool: {block.name}"
-                    except Exception as e:
-                        output = f"Error: {e}"
-                print(f"> {block.name}: {str(output)[:200]}")
-                results.append({"type": "tool_result", "tool_use_id": block.id, "content": str(output)})
-        messages.append({"role": "user", "content": results})
+        for tc in tool_calls:
+            if tc["name"] == "compact":
+                manual_compact = True
+                output = "Compressing..."
+            else:
+                handler = TOOL_HANDLERS.get(tc["name"])
+                try:
+                    output = handler(**tc["arguments"]) if handler else f"Unknown tool: {tc['name']}"
+                except Exception as e:
+                    output = f"Error: {e}"
+            print(f"> {tc['name']}: {str(output)[:200]}")
+            results.append({"role": "tool", "tool_call_id": tc["id"], "content": str(output)})
+        messages.extend(results)
         # Layer 3: manual compact triggered by the compact tool
         if manual_compact:
             print("[manual compact]")

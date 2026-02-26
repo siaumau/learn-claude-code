@@ -24,23 +24,22 @@ before each LLM call to deliver results.
 Key insight: "Fire and forget -- the agent doesn't block while the command runs."
 """
 
+import json
 import os
 import subprocess
 import threading
 import uuid
 from pathlib import Path
 
-from anthropic import Anthropic
+import requests
 from dotenv import load_dotenv
 
 load_dotenv(override=True)
 
-if os.getenv("ANTHROPIC_BASE_URL"):
-    os.environ.pop("ANTHROPIC_AUTH_TOKEN", None)
-
 WORKDIR = Path.cwd()
-client = Anthropic(base_url=os.getenv("ANTHROPIC_BASE_URL"))
-MODEL = os.environ["MODEL_ID"]
+OPENROUTER_API_KEY = os.environ["OPENROUTER_API_KEY"]
+OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
+MODEL = os.environ.get("MODEL_ID", "arcee-ai/trinity-large-preview:free")
 
 SYSTEM = f"You are a coding agent at {WORKDIR}. Use background_run for long-running commands."
 
@@ -170,18 +169,68 @@ TOOL_HANDLERS = {
 
 TOOLS = [
     {"name": "bash", "description": "Run a shell command (blocking).",
-     "input_schema": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}},
+     "parameters": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}},
     {"name": "read_file", "description": "Read file contents.",
-     "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "limit": {"type": "integer"}}, "required": ["path"]}},
+     "parameters": {"type": "object", "properties": {"path": {"type": "string"}, "limit": {"type": "integer"}}, "required": ["path"]}},
     {"name": "write_file", "description": "Write content to file.",
-     "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "content": {"type": "string"}}, "required": ["path", "content"]}},
+     "parameters": {"type": "object", "properties": {"path": {"type": "string"}, "content": {"type": "string"}}, "required": ["path", "content"]}},
     {"name": "edit_file", "description": "Replace exact text in file.",
-     "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "old_text": {"type": "string"}, "new_text": {"type": "string"}}, "required": ["path", "old_text", "new_text"]}},
+     "parameters": {"type": "object", "properties": {"path": {"type": "string"}, "old_text": {"type": "string"}, "new_text": {"type": "string"}}, "required": ["path", "old_text", "new_text"]}},
     {"name": "background_run", "description": "Run command in background thread. Returns task_id immediately.",
-     "input_schema": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}},
+     "parameters": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}},
     {"name": "check_background", "description": "Check background task status. Omit task_id to list all.",
-     "input_schema": {"type": "object", "properties": {"task_id": {"type": "string"}}}},
+     "parameters": {"type": "object", "properties": {"task_id": {"type": "string"}}}, "required": []},
 ]
+
+
+def call_openrouter(messages: list, tools: list = None, system: str = None):
+    """Call OpenRouter API and return parsed response."""
+    openai_messages = []
+    if system:
+        openai_messages.append({"role": "system", "content": system})
+    openai_messages.extend(messages)
+
+    payload = {
+        "model": MODEL,
+        "messages": openai_messages,
+        "max_tokens": 8000,
+    }
+    if tools:
+        payload["tools"] = tools
+        payload["tool_choice"] = "auto"
+
+    response = requests.post(
+        url=OPENROUTER_URL,
+        headers={
+            "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+            "Content-Type": "application/json",
+            "HTTP-Referer": "https://github.com/shareAI-lab/learn-claude-code",
+        },
+        data=json.dumps(payload),
+    )
+    response.raise_for_status()
+    data = response.json()
+
+    choice = data.get("choices", [{}])[0].get("message", {})
+    result = {
+        "content": choice.get("content", ""),
+        "tool_calls": [],
+    }
+
+    for tc in choice.get("tool_calls", []):
+        if tc.get("type") == "function":
+            func = tc.get("function", {})
+            try:
+                args = json.loads(func.get("arguments", "{}"))
+            except json.JSONDecodeError:
+                args = {}
+            result["tool_calls"].append({
+                "id": tc.get("id", ""),
+                "name": func.get("name", ""),
+                "arguments": args,
+            })
+
+    return result
 
 
 def agent_loop(messages: list):
@@ -194,24 +243,22 @@ def agent_loop(messages: list):
             )
             messages.append({"role": "user", "content": f"<background-results>\n{notif_text}\n</background-results>"})
             messages.append({"role": "assistant", "content": "Noted background results."})
-        response = client.messages.create(
-            model=MODEL, system=SYSTEM, messages=messages,
-            tools=TOOLS, max_tokens=8000,
-        )
-        messages.append({"role": "assistant", "content": response.content})
-        if response.stop_reason != "tool_use":
+        response = call_openrouter(messages, TOOLS, SYSTEM)
+        resp_content = response.get("content", "")
+        tool_calls = response.get("tool_calls", [])
+        messages.append({"role": "assistant", "content": resp_content})
+        if not tool_calls:
             return
         results = []
-        for block in response.content:
-            if block.type == "tool_use":
-                handler = TOOL_HANDLERS.get(block.name)
-                try:
-                    output = handler(**block.input) if handler else f"Unknown tool: {block.name}"
-                except Exception as e:
-                    output = f"Error: {e}"
-                print(f"> {block.name}: {str(output)[:200]}")
-                results.append({"type": "tool_result", "tool_use_id": block.id, "content": str(output)})
-        messages.append({"role": "user", "content": results})
+        for tc in tool_calls:
+            handler = TOOL_HANDLERS.get(tc["name"])
+            try:
+                output = handler(**tc["arguments"]) if handler else f"Unknown tool: {tc['name']}"
+            except Exception as e:
+                output = f"Error: {e}"
+            print(f"> {tc['name']}: {str(output)[:200]}")
+            results.append({"role": "tool", "tool_call_id": tc["id"], "content": str(output)})
+        messages.extend(results)
 
 
 if __name__ == "__main__":
